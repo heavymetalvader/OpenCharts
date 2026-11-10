@@ -13,14 +13,15 @@
 //    • held to the 16:00 close, or optionally stopped at N× a side's credit
 //
 //  Table: EV / win rate / credit / wing distance per entry slot; best slot is
-//  highlighted with its drawdown + streak stats. Chart: today's strikes for the
-//  best slot (solid) or a live "if you entered now" preview (dotted).
+//  highlighted with its drawdown + streak stats. Chart: every past day's condor
+//  for the best slot (green box = win, red = loss, label = P&L), plus today's
+//  strikes (solid) or a live "if you entered now" preview (dotted).
 //
 //  Limits (read these): the skew calibration is one snapshot. Real skew moves
 //  day to day, so historical credits are estimates, not fills. Recalibrate the
 //  ② inputs from a live chain now and then. Not financial advice.
 // ═══════════════════════════════════════════════════════════════════════════
-indicator("0DTE Iron Condor Lab", shorttitle = "0DTE IC Lab", overlay = true, max_lines_count = 60, max_labels_count = 60)
+indicator("0DTE Iron Condor Lab", shorttitle = "0DTE IC Lab", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
 
 string TZ = "America/New_York"
 
@@ -50,6 +51,9 @@ int minN         = input.int(30, "Min trades for a slot to be 'best'", minval = 
 int showFromH    = input.int(10, "Show slots from hour", minval = 9, maxval = 15, group = G3)
 int showToH      = input.int(15, "…through hour", minval = 9, maxval = 15, group = G3)
 bool showLines   = input.bool(true, "Draw today's strikes on the chart", group = G3)
+bool showPast    = input.bool(true, "Draw past days' condors on the chart", group = G3)
+string drawSlot  = input.string("Best (auto)", "Which entry time to draw", options = ["Best (auto)", "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30"], group = G3)
+int pastDays     = input.int(30, "Past days to draw", minval = 1, maxval = 100, group = G3)
 string tblPosIn  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = G3)
 string tszIn     = input.string("Small", "Table text", options = ["Tiny", "Small", "Normal"], group = G3)
 
@@ -151,6 +155,17 @@ var array<float> oCrC  = array.new<float>()
 var array<float> oExP  = array.new<float>()   // na = still open
 var array<float> oExC  = array.new<float>()
 var array<float> oS    = array.new<float>()
+var array<int>   oBar  = array.new<int>()     // entry bar_index
+// settled history (for drawing past days)
+var array<int>   hB    = array.new<int>()
+var array<int>   hIn   = array.new<int>()
+var array<int>   hOut  = array.new<int>()
+var array<float> hKp   = array.new<float>()
+var array<float> hKc   = array.new<float>()
+var array<float> hCr   = array.new<float>()
+var array<float> hPnl  = array.new<float>()
+var array<bool>  hStP  = array.new<bool>()
+var array<bool>  hStC  = array.new<bool>()
 // today's condor per slot (for display)
 var array<float> tKp  = array.new<float>(SB, na)
 var array<float> tKc  = array.new<float>(SB, na)
@@ -188,6 +203,26 @@ f_settle(float px) =>
             array.set(rWorstS, b, math.max(array.get(rWorstS, b), st))
             array.set(rWorst, b, math.min(array.get(rWorst, b), pnl))
             array.set(tPnl, b, pnl)
+            array.push(hB, b)
+            array.push(hIn, array.get(oBar, i))
+            array.push(hOut, bar_index)
+            array.push(hKp, kp)
+            array.push(hKc, kc)
+            array.push(hCr, array.get(oCrP, i) + array.get(oCrC, i))
+            array.push(hPnl, pnl)
+            array.push(hStP, not na(exP))
+            array.push(hStC, not na(exC))
+            if array.size(hB) > pastDays * 26
+                array.shift(hB)
+                array.shift(hIn)
+                array.shift(hOut)
+                array.shift(hKp)
+                array.shift(hKc)
+                array.shift(hCr)
+                array.shift(hPnl)
+                array.shift(hStP)
+                array.shift(hStC)
+    array.clear(oBar)
     array.clear(oB)
     array.clear(oKp)
     array.clear(oKc)
@@ -256,6 +291,7 @@ if inRth
             array.push(oExP, na)
             array.push(oExC, na)
             array.push(oS, S)
+            array.push(oBar, bar_index)
             array.set(tKp, b, kp)
             array.set(tKc, b, kc)
             array.set(tCr, b, crP + crC)
@@ -308,6 +344,44 @@ if barstate.islast and showLines
         f_lvl(pvKc, "now: short call " + f_k(pvKc), color.new(color.red, 20), line.style_dotted)
         f_lvl(pvKp, "now: short put " + f_k(pvKp), color.new(color.lime, 20), line.style_dotted)
         f_lvl(pvKp - width, "now: long put " + f_k(pvKp - width), color.new(color.lime, 50), line.style_dotted)
+
+// ───────────────────────────── Chart: past days ─────────────────────────────
+var array<box>   pBoxes = array.new<box>()
+var array<line>  pLines = array.new<line>()
+var array<label> pLabs  = array.new<label>()
+
+f_slotOf(string hm) =>
+    array<string> pr = str.split(hm, ":")
+    int m = int(str.tonumber(array.get(pr, 0))) * 60 + int(str.tonumber(array.get(pr, 1)))
+    int(math.floor((m - 570) / bucketMins))
+
+if barstate.islast and showPast
+    for bx in pBoxes
+        box.delete(bx)
+    array.clear(pBoxes)
+    for l in pLines
+        line.delete(l)
+    array.clear(pLines)
+    for lb in pLabs
+        label.delete(lb)
+    array.clear(pLabs)
+    int dB = drawSlot == "Best (auto)" ? bestB : f_slotOf(drawSlot)
+    int hn = array.size(hB)
+    if dB >= 0 and hn > 0
+        for i = 0 to hn - 1
+            if array.get(hB, i) == dB and bar_index - array.get(hIn, i) < 4900
+                int x1 = array.get(hIn, i)
+                int x2 = array.get(hOut, i)
+                float kp = array.get(hKp, i)
+                float kc = array.get(hKc, i)
+                float pl = array.get(hPnl, i)
+                color col = pl > 0 ? color.lime : color.red
+                array.push(pBoxes, box.new(x1, kc, x2, kp, border_color = color.new(col, 40), border_width = 1, bgcolor = color.new(col, 88)))
+                array.push(pLines, line.new(x1, kc + width, x2, kc + width, color = color.new(color.red, 60), style = line.style_dotted))
+                array.push(pLines, line.new(x1, kp - width, x2, kp - width, color = color.new(color.lime, 60), style = line.style_dotted))
+                string stops = (array.get(hStP, i) ? " P-stop" : "") + (array.get(hStC, i) ? " C-stop" : "")
+                string tip = f_k(kp) + "/" + f_k(kp - width) + "P + " + f_k(kc) + "/" + f_k(kc + width) + "C\ncredit $" + str.tostring(array.get(hCr, i), "#.##") + "\nresult " + f_money(pl) + stops
+                array.push(pLabs, label.new(x2, kc + width, f_money(pl) + stops, style = label.style_label_down, color = color.new(col, 30), textcolor = color.black, size = size.tiny, tooltip = tip))
 
 // ───────────────────────────── Table ─────────────────────────────
 string tblPos = switch tblPosIn
