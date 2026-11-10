@@ -45,6 +45,7 @@ float cB         = input.float(0.0882, "b", step = 0.001, group = G2, inline = "
 float fillSlip   = input.float(0.05, "Fill = mid minus N per vertical", minval = 0, step = 0.05, group = G2, tooltip = "Real SPX 0DTE legs were 0.05–0.10 wide. 0.05 = patient limit order; 0.10–0.15 = hitting the natural.")
 float feeContract = input.float(1.20, "Fees per contract ($)", minval = 0, step = 0.05, group = G2, tooltip = "Commission + SPX exchange/regulatory fees. 4 legs per condor, +2 per stopped side.")
 string ivSym     = input.symbol("CBOE:VIX1D", "Implied-vol index", group = G2)
+bool vixFallback = input.bool(false, "Use VIX on days with no VIX1D data", group = G2, tooltip = "Off = skip those days. VIX is a 30-day measure and misprices 0DTE; turning this on adds older history but makes it less accurate.")
 
 string G3 = "③ Display"
 int minN         = input.int(30, "Min trades for a slot to be 'best'", minval = 5, group = G3)
@@ -120,14 +121,14 @@ f_k(float k) =>
 
 // ───────────────────────────── Data ─────────────────────────────
 bool inRth  = not na(time(timeframe.period, "0930-1600", TZ))
-bool newRth = inRth and not inRth[1]
+bool newRth = inRth and (not inRth[1] or dayofmonth(time, TZ) != dayofmonth(time[1], TZ))   // SPX has no after-hours bars, so also detect a date change
 int mOpen   = hour(time, TZ) * 60 + minute(time, TZ)
 int mClose  = hour(time_close, TZ) * 60 + minute(time_close, TZ)
 int nb      = int(390 / bucketMins)
 
 float ivRaw  = request.security(ivSym, timeframe.period, close, ignore_invalid_symbol = true)
 float ivBack = request.security("TVC:VIX", timeframe.period, close, ignore_invalid_symbol = true)
-float ivNow  = not na(ivRaw) ? ivRaw : ivBack
+float ivNow  = not na(ivRaw) ? ivRaw : vixFallback ? ivBack : na
 float ivPrev = ivNow[1]
 
 // ───────────────────────────── State ─────────────────────────────

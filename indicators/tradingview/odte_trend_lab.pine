@@ -88,7 +88,7 @@ f_short(string f) =>
 
 // ───────────────────────────── Data (all known at the bar's open) ─────────────────────────────
 bool inRth  = not na(time(timeframe.period, "0930-1600", TZ))
-bool newRth = inRth and not inRth[1]
+bool newRth = inRth and (not inRth[1] or dayofmonth(time, TZ) != dayofmonth(time[1], TZ))   // SPX has no after-hours bars, so also detect a date change
 int mOpen   = hour(time, TZ) * 60 + minute(time, TZ)
 int mClose  = hour(time_close, TZ) * 60 + minute(time_close, TZ)
 int nb      = int(390 / bucketMins)

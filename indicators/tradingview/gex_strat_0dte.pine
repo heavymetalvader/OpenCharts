@@ -166,7 +166,7 @@ f_ceilStep(float x, float step) =>
 
 // ═════════════════════════════ Session ═════════════════════════════
 bool inRth  = not na(time(timeframe.period, "0930-1600", TZ))
-bool newRth = inRth and not inRth[1]
+bool newRth = inRth and (not inRth[1] or dayofmonth(time, TZ) != dayofmonth(time[1], TZ))   // SPX has no after-hours bars, so also detect a date change
 string orSess = switch orMins
     5  => "0930-0935"
     15 => "0930-0945"
