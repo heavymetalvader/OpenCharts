@@ -1,0 +1,384 @@
+// This Pine Script® code is subject to the terms of the MIT License.
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  0DTE IRON CONDOR LAB — skew-calibrated credits, best entry time, live strikes
+//
+//  Every time slot, it opens a simulated SPX 0DTE iron condor:
+//    • short strikes picked by DELTA (like your broker), using skewed IV
+//    • credits priced with a skew model calibrated to real Cboe SPX quotes:
+//        ATM IV = 0.866 × VIX1D
+//        IV(K) = ATM × (1 + a·z + b·z²),  z = ln(K/S) / ATM 1σ
+//      In calibration it matched actual 10-wide spread mids to within $0.01–0.06.
+//    • fill = model mid − slippage per vertical, plus per-contract fees
+//    • held to the 16:00 close, or optionally stopped at N× a side's credit
+//
+//  Table: EV / win rate / credit / wing distance per entry slot; best slot is
+//  highlighted with its drawdown + streak stats. Chart: today's strikes for the
+//  best slot (solid) or a live "if you entered now" preview (dotted).
+//
+//  Limits (read these): the skew calibration is one snapshot. Real skew moves
+//  day to day, so historical credits are estimates, not fills. Recalibrate the
+//  ② inputs from a live chain now and then. Not financial advice.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("0DTE Iron Condor Lab", shorttitle = "0DTE IC Lab", overlay = true, max_lines_count = 60, max_labels_count = 60)
+
+string TZ = "America/New_York"
+
+// ───────────────────────────── Inputs ─────────────────────────────
+string G1 = "① Condor rules"
+float putDelta   = input.float(0.15, "Short put delta", minval = 0.03, maxval = 0.45, step = 0.01, group = G1)
+float callDelta  = input.float(0.15, "Short call delta", minval = 0.03, maxval = 0.45, step = 0.01, group = G1)
+float width      = input.float(10, "Wing width (points)", minval = 5, step = 5, group = G1)
+float strikeInc  = input.float(5, "Strike increment", minval = 1, step = 1, group = G1)
+float minCredit  = input.float(0.50, "Skip if total credit below", minval = 0, step = 0.05, group = G1)
+float stopMult   = input.float(0.0, "Stop a side at N× its credit (0 = hold to close)", minval = 0, step = 0.5, group = G1, tooltip = "Checked on each bar's close using the same pricing model. Common 0DTE rule: 2×.")
+int bucketMins   = input.int(30, "Time slot size (minutes)", options = [30, 60], group = G1)
+int minMinsLeft  = input.int(30, "No entries with fewer than N minutes left", minval = 5, group = G1)
+
+string G2 = "② Pricing calibration (fit to real Cboe SPX quotes)"
+float atmRatio   = input.float(0.866, "ATM IV ÷ VIX1D", minval = 0.5, maxval = 1.5, step = 0.001, group = G2)
+float pA         = input.float(-0.0754, "Put skew a", step = 0.001, group = G2, inline = "p")
+float pB         = input.float(0.0247, "b", step = 0.001, group = G2, inline = "p")
+float cA         = input.float(-0.2048, "Call skew a", step = 0.001, group = G2, inline = "c")
+float cB         = input.float(0.0882, "b", step = 0.001, group = G2, inline = "c")
+float fillSlip   = input.float(0.05, "Fill = mid minus N per vertical", minval = 0, step = 0.05, group = G2, tooltip = "Real SPX 0DTE legs were 0.05–0.10 wide. 0.05 = patient limit order; 0.10–0.15 = hitting the natural.")
+float feeContract = input.float(1.20, "Fees per contract ($)", minval = 0, step = 0.05, group = G2, tooltip = "Commission + SPX exchange/regulatory fees. 4 legs per condor, +2 per stopped side.")
+string ivSym     = input.symbol("CBOE:VIX1D", "Implied-vol index", group = G2)
+
+string G3 = "③ Display"
+int minN         = input.int(30, "Min trades for a slot to be 'best'", minval = 5, group = G3)
+int showFromH    = input.int(10, "Show slots from hour", minval = 9, maxval = 15, group = G3)
+int showToH      = input.int(15, "…through hour", minval = 9, maxval = 15, group = G3)
+bool showLines   = input.bool(true, "Draw today's strikes on the chart", group = G3)
+string tblPosIn  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = G3)
+string tszIn     = input.string("Small", "Table text", options = ["Tiny", "Small", "Normal"], group = G3)
+
+// ───────────────────────────── Pricing model ─────────────────────────────
+f_ncdf(float x) =>
+    float t = 1.0 / (1.0 + 0.2316419 * math.abs(x))
+    float d = 0.3989422804014327 * math.exp(-x * x / 2.0)
+    float p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    x >= 0 ? 1.0 - p : p
+
+// ATM 1σ (fraction of price) for the rest of the session
+f_sda(float ivIdx, float minsLeft) =>
+    ivIdx / 100 * atmRatio * math.sqrt(math.max(minsLeft, 0) / (252.0 * 390.0))
+
+f_sdK(float S, float K, float sda) =>
+    float z = math.log(K / S) / sda
+    float r = z < 0 ? 1 + pA * z + pB * z * z : 1 + cA * z + cB * z * z
+    sda * math.max(r, 0.4)
+
+f_opt(float S, float K, float sda, bool isCall) =>
+    float res = isCall ? math.max(S - K, 0) : math.max(K - S, 0)
+    if sda > 1e-6
+        float sd = f_sdK(S, K, sda)
+        float d1 = (math.log(S / K) + 0.5 * sd * sd) / sd
+        float d2 = d1 - sd
+        res := isCall ? S * f_ncdf(d1) - K * f_ncdf(d2) : K * f_ncdf(-d2) - S * f_ncdf(-d1)
+    res
+
+f_delta(float S, float K, float sda, bool isCall) =>
+    float sd = f_sdK(S, K, sda)
+    float d1 = (math.log(S / K) + 0.5 * sd * sd) / sd
+    isCall ? f_ncdf(d1) : f_ncdf(d1) - 1
+
+f_vert(float S, float kShort, float kLong, float sda, bool isCall) =>
+    f_opt(S, kShort, sda, isCall) - f_opt(S, kLong, sda, isCall)
+
+f_findPut(float S, float sda) =>
+    float k = math.floor(S / strikeInc) * strikeInc
+    int i = 0
+    while math.abs(f_delta(S, k, sda, false)) > putDelta and i < 400
+        k -= strikeInc
+        i += 1
+    k
+
+f_findCall(float S, float sda) =>
+    float k = math.ceil(S / strikeInc) * strikeInc
+    int i = 0
+    while f_delta(S, k, sda, true) > callDelta and i < 400
+        k += strikeInc
+        i += 1
+    k
+
+// ───────────────────────────── Formatting ─────────────────────────────
+f_hm(int m) =>
+    int h = int(math.floor(m / 60))
+    int mm = m % 60
+    str.tostring(h) + ":" + (mm < 10 ? "0" : "") + str.tostring(mm)
+
+f_money(float x) =>
+    na(x) ? "—" : (x < 0 ? "−$" : "$") + str.tostring(math.abs(x), "#,###")
+
+f_k(float k) =>
+    str.tostring(k, "#")
+
+// ───────────────────────────── Data ─────────────────────────────
+bool inRth  = not na(time(timeframe.period, "0930-1600", TZ))
+bool newRth = inRth and not inRth[1]
+int mOpen   = hour(time, TZ) * 60 + minute(time, TZ)
+int mClose  = hour(time_close, TZ) * 60 + minute(time_close, TZ)
+int nb      = int(390 / bucketMins)
+
+float ivRaw  = request.security(ivSym, timeframe.period, close, ignore_invalid_symbol = true)
+float ivBack = request.security("TVC:VIX", timeframe.period, close, ignore_invalid_symbol = true)
+float ivNow  = not na(ivRaw) ? ivRaw : ivBack
+float ivPrev = ivNow[1]
+
+// ───────────────────────────── State ─────────────────────────────
+int SB = 26
+// per-slot stats
+var array<float> sN    = array.new<float>(SB, 0.0)
+var array<float> sWin  = array.new<float>(SB, 0.0)
+var array<float> sPnl  = array.new<float>(SB, 0.0)
+var array<float> sCr   = array.new<float>(SB, 0.0)
+var array<float> sPutD = array.new<float>(SB, 0.0)
+var array<float> sCalD = array.new<float>(SB, 0.0)
+// per-slot risk (one condor per day at that slot)
+var array<float> rCum    = array.new<float>(SB, 0.0)
+var array<float> rPeak   = array.new<float>(SB, 0.0)
+var array<float> rDD     = array.new<float>(SB, 0.0)
+var array<int>   rStreak = array.new<int>(SB, 0)
+var array<int>   rWorstS = array.new<int>(SB, 0)
+var array<float> rWorst  = array.new<float>(SB, 0.0)
+// open condors
+var array<int>   oB    = array.new<int>()
+var array<float> oKp   = array.new<float>()
+var array<float> oKc   = array.new<float>()
+var array<float> oCrP  = array.new<float>()
+var array<float> oCrC  = array.new<float>()
+var array<float> oExP  = array.new<float>()   // na = still open
+var array<float> oExC  = array.new<float>()
+var array<float> oS    = array.new<float>()
+// today's condor per slot (for display)
+var array<float> tKp  = array.new<float>(SB, na)
+var array<float> tKc  = array.new<float>(SB, na)
+var array<float> tCr  = array.new<float>(SB, na)
+var array<float> tPnl = array.new<float>(SB, na)
+
+var int days = 0
+var float lastRthClose = na
+
+f_settle(float px) =>
+    int n = array.size(oB)
+    if n > 0 and not na(px)
+        for i = 0 to n - 1
+            int b = array.get(oB, i)
+            float kp = array.get(oKp, i)
+            float kc = array.get(oKc, i)
+            float exP = array.get(oExP, i)
+            float exC = array.get(oExC, i)
+            float sideP = array.get(oCrP, i) - (na(exP) ? math.min(width, math.max(0.0, kp - px)) : exP)
+            float sideC = array.get(oCrC, i) - (na(exC) ? math.min(width, math.max(0.0, px - kc)) : exC)
+            int legs = 4 + (na(exP) ? 0 : 2) + (na(exC) ? 0 : 2)
+            float pnl = (sideP + sideC) * 100 - feeContract * legs
+            array.set(sN, b, array.get(sN, b) + 1)
+            array.set(sWin, b, array.get(sWin, b) + (pnl > 0 ? 1 : 0))
+            array.set(sPnl, b, array.get(sPnl, b) + pnl)
+            array.set(sCr, b, array.get(sCr, b) + array.get(oCrP, i) + array.get(oCrC, i))
+            array.set(sPutD, b, array.get(sPutD, b) + array.get(oS, i) - kp)
+            array.set(sCalD, b, array.get(sCalD, b) + kc - array.get(oS, i))
+            float c = array.get(rCum, b) + pnl
+            array.set(rCum, b, c)
+            array.set(rPeak, b, math.max(array.get(rPeak, b), c))
+            array.set(rDD, b, math.max(array.get(rDD, b), array.get(rPeak, b) - c))
+            int st = pnl < 0 ? array.get(rStreak, b) + 1 : 0
+            array.set(rStreak, b, st)
+            array.set(rWorstS, b, math.max(array.get(rWorstS, b), st))
+            array.set(rWorst, b, math.min(array.get(rWorst, b), pnl))
+            array.set(tPnl, b, pnl)
+    array.clear(oB)
+    array.clear(oKp)
+    array.clear(oKc)
+    array.clear(oCrP)
+    array.clear(oCrC)
+    array.clear(oExP)
+    array.clear(oExC)
+    array.clear(oS)
+
+// best slot = highest EV per condor with enough trades
+f_best() =>
+    int best = -1
+    float bestEv = -1e10
+    for b = 0 to nb - 1
+        float n = array.get(sN, b)
+        if n >= minN
+            float ev = array.get(sPnl, b) / n
+            if ev > bestEv
+                bestEv := ev
+                best := b
+    best
+
+// ───────────────────────────── Engine ─────────────────────────────
+if newRth
+    f_settle(lastRthClose)
+    days += 1
+    for b = 0 to SB - 1
+        array.set(tKp, b, na)
+        array.set(tKc, b, na)
+        array.set(tCr, b, na)
+        array.set(tPnl, b, na)
+
+int bestB = f_best()
+
+if inRth
+    // 1) stops on condors opened earlier, valued at this bar's close
+    int n = array.size(oB)
+    float minsLeftC = 960 - mClose
+    if stopMult > 0 and n > 0 and minsLeftC > 0 and not na(ivNow)
+        float sdaC = f_sda(ivNow, minsLeftC)
+        for i = 0 to n - 1
+            if na(array.get(oExP, i))
+                float v = f_vert(close, array.get(oKp, i), array.get(oKp, i) - width, sdaC, false)
+                if v >= stopMult * array.get(oCrP, i)
+                    array.set(oExP, i, math.min(width, v + fillSlip))
+            if na(array.get(oExC, i))
+                float v = f_vert(close, array.get(oKc, i), array.get(oKc, i) + width, sdaC, true)
+                if v >= stopMult * array.get(oCrC, i)
+                    array.set(oExC, i, math.min(width, v + fillSlip))
+    // 2) new condor at the start of each slot, priced at this bar's open
+    float minsLeftO = 960 - mOpen
+    if not newRth and mOpen > 570 and (mOpen - 570) % bucketMins == 0 and minsLeftO >= minMinsLeft and not na(ivPrev) and ivPrev > 0
+        float S   = open
+        float sda = f_sda(ivPrev, minsLeftO)
+        float kp  = f_findPut(S, sda)
+        float kc  = f_findCall(S, sda)
+        float crP = f_vert(S, kp, kp - width, sda, false) - fillSlip
+        float crC = f_vert(S, kc, kc + width, sda, true) - fillSlip
+        if crP > 0 and crC > 0 and crP + crC >= minCredit
+            int b = int(math.floor((mOpen - 570) / bucketMins))
+            array.push(oB, b)
+            array.push(oKp, kp)
+            array.push(oKc, kc)
+            array.push(oCrP, crP)
+            array.push(oCrC, crC)
+            array.push(oExP, na)
+            array.push(oExC, na)
+            array.push(oS, S)
+            array.set(tKp, b, kp)
+            array.set(tKc, b, kc)
+            array.set(tCr, b, crP + crC)
+            if b == bestB
+                alert("IRON CONDOR @ " + f_hm(mOpen) + " (best slot): sell " + f_k(kp) + "/" + f_k(kp - width) + " puts + " + f_k(kc) + "/" + f_k(kc + width) + " calls for ~$" + str.tostring(crP + crC, "#.##") + " (fill at mid − " + str.tostring(fillSlip) + "/side)", alert.freq_once_per_bar)
+    lastRthClose := close
+    if mClose >= 960
+        f_settle(close)
+
+// ───────────────────────────── Chart: today's strikes ─────────────────────────────
+var array<line> lns = array.new<line>()
+var array<label> lbs = array.new<label>()
+
+f_lvl(float y, string txt, color col, string sty) =>
+    array.push(lns, line.new(bar_index - 30, y, bar_index + 8, y, color = col, style = sty, width = 2))
+    array.push(lbs, label.new(bar_index + 8, y, txt, style = label.style_label_left, color = color.new(col, 80), textcolor = col, size = size.small))
+
+// live "if entered now" preview
+float pvKp = na
+float pvKc = na
+float pvCr = na
+float pvCrP = na
+float pvCrC = na
+if barstate.islast and inRth and 960 - mClose >= minMinsLeft and not na(ivNow)
+    float sdaN = f_sda(ivNow, 960 - mClose)
+    pvKp := f_findPut(close, sdaN)
+    pvKc := f_findCall(close, sdaN)
+    pvCrP := f_vert(close, pvKp, pvKp - width, sdaN, false) - fillSlip
+    pvCrC := f_vert(close, pvKc, pvKc + width, sdaN, true) - fillSlip
+    pvCr := pvCrP + pvCrC
+
+if barstate.islast and showLines
+    for l in lns
+        line.delete(l)
+    array.clear(lns)
+    for lb in lbs
+        label.delete(lb)
+    array.clear(lbs)
+    bool haveToday = bestB >= 0 and not na(array.get(tKp, bestB))
+    if haveToday
+        float kp = array.get(tKp, bestB)
+        float kc = array.get(tKc, bestB)
+        string tag = f_hm(570 + bestB * bucketMins) + " IC "
+        f_lvl(kc + width, tag + "long call " + f_k(kc + width), color.new(color.red, 40), line.style_solid)
+        f_lvl(kc, tag + "SHORT CALL " + f_k(kc), color.red, line.style_solid)
+        f_lvl(kp, tag + "SHORT PUT " + f_k(kp), color.lime, line.style_solid)
+        f_lvl(kp - width, tag + "long put " + f_k(kp - width), color.new(color.lime, 40), line.style_solid)
+    else if not na(pvKp)
+        f_lvl(pvKc + width, "now: long call " + f_k(pvKc + width), color.new(color.red, 50), line.style_dotted)
+        f_lvl(pvKc, "now: short call " + f_k(pvKc), color.new(color.red, 20), line.style_dotted)
+        f_lvl(pvKp, "now: short put " + f_k(pvKp), color.new(color.lime, 20), line.style_dotted)
+        f_lvl(pvKp - width, "now: long put " + f_k(pvKp - width), color.new(color.lime, 50), line.style_dotted)
+
+// ───────────────────────────── Table ─────────────────────────────
+string tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+string tsz = tszIn == "Tiny" ? size.tiny : tszIn == "Normal" ? size.normal : size.small
+var table tb = table.new(tblPos, 6, 30, bgcolor = color.new(#0e1117, 5), frame_color = color.new(#3a3f4b, 0), frame_width = 1, border_color = color.new(#2a2e39, 0), border_width = 1)
+
+f_hdr(int c, string t) =>
+    table.cell(tb, c, 0, t, text_color = color.white, text_size = tsz)
+
+f_wide(int r, string t, color tc, color bg) =>
+    table.cell(tb, 0, r, t, text_color = tc, bgcolor = bg, text_size = tsz, text_halign = text.align_left)
+    table.merge_cells(tb, 0, r, 5, r)
+
+if barstate.islast
+    table.clear(tb, 0, 0, 5, 29)   // reset merges each realtime tick
+    f_hdr(0, "Entry (ET)")
+    f_hdr(1, "EV / IC")
+    f_hdr(2, "Win")
+    f_hdr(3, "Credit")
+    f_hdr(4, "Wings −P / +C")
+    f_hdr(5, "n")
+    int r = 1
+    for b = 0 to nb - 1
+        int m0 = 570 + b * bucketMins
+        int h0 = int(math.floor(m0 / 60))
+        if h0 >= showFromH and h0 <= showToH
+            float n = array.get(sN, b)
+            bool isBest = b == bestB
+            color bg = isBest ? color.new(color.lime, 60) : color.new(#0e1117, 100)
+            color lc = isBest ? color.black : color.new(color.white, 30)
+            table.cell(tb, 0, r, (isBest ? "★ " : "") + f_hm(m0), text_color = lc, bgcolor = bg, text_size = tsz, text_halign = text.align_left)
+            if n > 0
+                float ev = array.get(sPnl, b) / n
+                color vc = isBest ? color.black : n < minN ? color.gray : ev > 0 ? color.lime : color.red
+                table.cell(tb, 1, r, f_money(ev), text_color = vc, bgcolor = bg, text_size = tsz)
+                table.cell(tb, 2, r, str.tostring(100 * array.get(sWin, b) / n, "#") + "%", text_color = isBest ? color.black : color.white, bgcolor = bg, text_size = tsz)
+                table.cell(tb, 3, r, "$" + str.tostring(100 * array.get(sCr, b) / n, "#"), text_color = isBest ? color.black : color.white, bgcolor = bg, text_size = tsz)
+                table.cell(tb, 4, r, "−" + str.tostring(array.get(sPutD, b) / n, "#") + " / +" + str.tostring(array.get(sCalD, b) / n, "#"), text_color = isBest ? color.black : color.white, bgcolor = bg, text_size = tsz)
+                table.cell(tb, 5, r, str.tostring(n, "#"), text_color = isBest ? color.black : color.gray, bgcolor = bg, text_size = tsz)
+            else
+                for c = 1 to 5
+                    table.cell(tb, c, r, "—", text_color = color.gray, bgcolor = bg, text_size = tsz)
+            r += 1
+
+    // best slot detail
+    if bestB >= 0
+        string bl = f_hm(570 + bestB * bucketMins)
+        f_wide(r, "★ BEST ENTRY " + bl + "  ·  max drawdown " + f_money(-array.get(rDD, bestB)) + "  ·  worst streak " + str.tostring(array.get(rWorstS, bestB)) + " losses  ·  worst day " + f_money(array.get(rWorst, bestB)) + "  ·  total " + f_money(array.get(rCum, bestB)), color.lime, color.new(color.lime, 88))
+        r += 1
+        float tk = array.get(tKp, bestB)
+        string todayTxt = ""
+        if not na(tk)
+            float tkc = array.get(tKc, bestB)
+            float tpl = array.get(tPnl, bestB)
+            todayTxt := "TODAY " + bl + " IC:  " + f_k(tk) + "/" + f_k(tk - width) + "P  +  " + f_k(tkc) + "/" + f_k(tkc + width) + "C  @ $" + str.tostring(array.get(tCr, bestB), "#.##") + (na(tpl) ? "  (open)" : "  → " + f_money(tpl))
+        else
+            todayTxt := "TODAY: waiting for " + bl + ". Strikes are set when that slot opens (alert fires with them)."
+        f_wide(r, todayTxt, color.white, color.new(#1b2230, 0))
+        r += 1
+    else
+        f_wide(r, "Not enough history for a best slot yet. Load more bars or lower 'Min trades'.", color.orange, color.new(#0e1117, 100))
+        r += 1
+
+    if not na(pvKp)
+        f_wide(r, "IF ENTERED NOW:  " + f_k(pvKp) + "/" + f_k(pvKp - width) + "P  +  " + f_k(pvKc) + "/" + f_k(pvKc + width) + "C   credit ≈ $" + str.tostring(pvCr, "#.##") + "  (P " + str.tostring(pvCrP, "#.##") + " · C " + str.tostring(pvCrC, "#.##") + ")   max loss ≈ " + f_money(-(width - pvCr) * 100), color.new(color.white, 15), color.new(#0e1117, 100))
+        r += 1
+
+    string warn = not timeframe.isintraday or timeframe.in_seconds() > bucketMins * 60 ? "⚠ Use an intraday chart ≤ slot size (15m recommended).  " : ""
+    f_wide(r, warn + str.tostring(days) + " sessions · " + str.tostring(putDelta * 100, "#") + "Δ put / " + str.tostring(callDelta * 100, "#") + "Δ call · " + str.tostring(width, "#") + "-wide · fill mid−" + str.tostring(fillSlip) + "/side · $" + str.tostring(feeContract) + "/contract · " + (stopMult > 0 ? "stop " + str.tostring(stopMult) + "× credit" : "held to close"), color.new(color.white, 45), color.new(#0e1117, 100))
