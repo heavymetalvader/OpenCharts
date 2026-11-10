@@ -286,9 +286,11 @@ if barstate.islast
                 txt := main + "  " + str.tostring(wr, "#") + "%  n" + str.tostring(n, "#")
                 if showMode == "Win rate"
                     txt := main + "  $" + f_signed(ev) + "  n" + str.tostring(n, "#")
-                tc := n < minN ? color.new(color.gray, 20) : ev > 0 ? color.lime : color.red
-                if n >= minN
-                    bg := ev > 0 ? color.new(color.lime, 90) : color.new(color.red, 88)
+                // In edge mode, color by edge vs baseline (not raw EV)
+                float score = showMode == "Edge vs baseline" and s > 0 ? (na(baseEv) ? na : ev - baseEv) : ev
+                tc := n < minN or na(score) ? color.new(color.gray, 20) : score > 0 ? color.lime : color.red
+                if n >= minN and not na(score)
+                    bg := score > 0 ? color.new(color.lime, 90) : color.new(color.red, 88)
                 if s == bestS and b == bestB
                     bg := color.new(color.lime, 55)
                     tc := color.black
