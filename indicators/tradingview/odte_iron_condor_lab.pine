@@ -368,8 +368,10 @@ if barstate.islast and showPast
     int dB = drawSlot == "Best (auto)" ? bestB : f_slotOf(drawSlot)
     int hn = array.size(hB)
     if dB >= 0 and hn > 0
-        for i = 0 to hn - 1
-            if array.get(hB, i) == dB and bar_index - array.get(hIn, i) < 4900
+        int drawn = 0
+        for i = hn - 1 to 0     // newest first, stop after pastDays
+            if drawn < pastDays and array.get(hB, i) == dB and bar_index - array.get(hIn, i) < 4900
+                drawn += 1
                 int x1 = array.get(hIn, i)
                 int x2 = array.get(hOut, i)
                 float kp = array.get(hKp, i)
