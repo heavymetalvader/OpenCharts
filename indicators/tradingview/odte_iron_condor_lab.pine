@@ -5,10 +5,13 @@
 //
 //  Every time slot, it opens a simulated SPX 0DTE iron condor:
 //    • short strikes picked by DELTA (like your broker), using skewed IV
-//    • credits priced with a skew model calibrated to real Cboe SPX quotes:
-//        ATM IV = 0.866 × VIX1D
-//        IV(K) = ATM × (1 + a·z + b·z²),  z = ln(K/S) / ATM 1σ
-//      In calibration it matched actual 10-wide spread mids to within $0.01–0.06.
+//    • credits priced with a skew model calibrated to real Cboe SPX 0DTE quotes,
+//      measured every 30 min through the 2026-11-10 session (TIME-OF-DAY curve):
+//        ATM IV = ratio(t) × VIX1D      (0.88 at 10:20 → 0.62 at 14:00–14:45)
+//        IV(K)  = ATM × (1 + a(t)·z + b(t)·z²),  z = ln(K/S) / ATM 1σ
+//      VIX1D drifts UP through the afternoon while real 0DTE vol does not, so a
+//      single ratio overpriced afternoon credits by 35–70%. Leave-one-out check:
+//      average credit error 35% (flat) → 9% (time-of-day).
 //    • fill = model mid − slippage per vertical, plus per-contract fees
 //    • held to the 16:00 close, or optionally stopped at N× a side's credit
 //
@@ -17,9 +20,10 @@
 //  for the best slot (green box = win, red = loss, label = P&L), plus today's
 //  strikes (solid) or a live "if you entered now" preview (dotted).
 //
-//  Limits (read these): the skew calibration is one snapshot. Real skew moves
-//  day to day, so historical credits are estimates, not fills. Recalibrate the
-//  ② inputs from a live chain now and then. Not financial advice.
+//  Limits (read these): the calibration is ONE day of quotes. Real skew and the
+//  VIX1D gap move day to day, so historical credits are estimates, not fills.
+//  Use "Vol scale" to match your broker, and recalibrate periodically
+//  (backtest/snapshot_0dte.py). Not financial advice.
 // ═══════════════════════════════════════════════════════════════════════════
 indicator("0DTE Iron Condor Lab", shorttitle = "0DTE IC Lab", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
 
@@ -37,10 +41,12 @@ int bucketMins   = input.int(30, "Time slot size (minutes)", options = [30, 60],
 int minMinsLeft  = input.int(30, "No entries with fewer than N minutes left", minval = 5, group = G1)
 
 string G2 = "② Pricing calibration (fit to real Cboe SPX quotes)"
-float atmRatio   = input.float(0.866, "ATM IV ÷ VIX1D", minval = 0.5, maxval = 1.5, step = 0.001, group = G2)
-float pA         = input.float(-0.0754, "Put skew a", step = 0.001, group = G2, inline = "p")
+bool useTod      = input.bool(true, "Time-of-day calibration (measured 2026-11-10)", group = G2, tooltip = "ON: ATM-vol ratio and skew follow the intraday curve measured from real 0DTE quotes. OFF: use the flat values below (older closing-snapshot fit, overprices afternoon credits).")
+float volScale   = input.float(1.0, "Vol scale (match your broker)", minval = 0.5, maxval = 1.5, step = 0.01, group = G2, tooltip = "If your broker's mid for the 'IF ENTERED NOW' strikes is consistently lower than the lab's credit, lower this (e.g. 0.95); if higher, raise it.")
+float atmRatio   = input.float(0.866, "Flat: ATM IV ÷ VIX1D", minval = 0.5, maxval = 1.5, step = 0.001, group = G2)
+float pA         = input.float(-0.0754, "Flat: put skew a", step = 0.001, group = G2, inline = "p")
 float pB         = input.float(0.0247, "b", step = 0.001, group = G2, inline = "p")
-float cA         = input.float(-0.2048, "Call skew a", step = 0.001, group = G2, inline = "c")
+float cA         = input.float(-0.2048, "Flat: call skew a", step = 0.001, group = G2, inline = "c")
 float cB         = input.float(0.0882, "b", step = 0.001, group = G2, inline = "c")
 float fillSlip   = input.float(0.05, "Fill = mid minus N per vertical", minval = 0, step = 0.05, group = G2, tooltip = "Real SPX 0DTE legs were 0.05–0.10 wide. 0.05 = patient limit order; 0.10–0.15 = hitting the natural.")
 float feeContract = input.float(1.20, "Fees per contract ($)", minval = 0, step = 0.05, group = G2, tooltip = "Commission + SPX exchange/regulatory fees. 4 legs per condor, +2 per stopped side.")
@@ -65,44 +71,74 @@ f_ncdf(float x) =>
     float p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
     x >= 0 ? 1.0 - p : p
 
-// ATM 1σ (fraction of price) for the rest of the session
-f_sda(float ivIdx, float minsLeft) =>
-    ivIdx / 100 * atmRatio * math.sqrt(math.max(minsLeft, 0) / (252.0 * 390.0))
+// Time-of-day calibration, measured from Cboe SPX 0DTE quotes on 2026-11-10.
+// x = minutes after 09:30; values are interpolated linearly, held flat outside.
+var array<float> calM  = array.from(50.0, 76.0, 108.0, 136.0, 166.0, 197.0, 226.0, 256.0, 287.0, 316.0, 346.0, 376.0)
+var array<float> calR  = array.from(0.875, 0.829, 0.799, 0.746, 0.711, 0.682, 0.705, 0.618, 0.617, 0.614, 0.704, 0.985)
+var array<float> calPA = array.from(-0.106, -0.133, -0.137, -0.132, -0.127, -0.118, -0.116, -0.078, -0.073, -0.053, -0.037, 0.033)
+var array<float> calPB = array.from(0.016, 0.016, 0.015, 0.017, 0.021, 0.021, 0.021, 0.029, 0.035, 0.043, 0.047, 0.061)
+var array<float> calCA = array.from(-0.063, -0.086, -0.087, -0.085, -0.067, -0.048, -0.098, -0.043, 0.001, 0.000, 0.012, 0.021)
+var array<float> calCB = array.from(0.052, 0.063, 0.063, 0.068, 0.061, 0.060, 0.068, 0.059, 0.051, 0.052, 0.044, 0.038)
 
-f_sdK(float S, float K, float sda) =>
+f_interp(array<float> ys, float m) =>
+    int n = array.size(calM)
+    float res = array.get(ys, 0)
+    if m >= array.get(calM, n - 1)
+        res := array.get(ys, n - 1)
+    else if m > array.get(calM, 0)
+        for i = 0 to n - 2
+            float m0 = array.get(calM, i)
+            float m1 = array.get(calM, i + 1)
+            if m >= m0 and m <= m1
+                float w = (m - m0) / (m1 - m0)
+                res := array.get(ys, i) + (array.get(ys, i + 1) - array.get(ys, i)) * w
+                break
+    res
+
+// ATM 1σ (fraction of price) for the rest of the session; ml = minutes left
+f_sda(float ivIdx, float ml) =>
+    float ratio = (useTod ? f_interp(calR, 390 - ml) : atmRatio) * volScale
+    ivIdx / 100 * ratio * math.sqrt(math.max(ml, 0) / (252.0 * 390.0))
+
+f_sdK(float S, float K, float sda, float ml) =>
+    float t  = 390 - ml
+    float a1 = useTod ? f_interp(calPA, t) : pA
+    float b1 = useTod ? f_interp(calPB, t) : pB
+    float a2 = useTod ? f_interp(calCA, t) : cA
+    float b2 = useTod ? f_interp(calCB, t) : cB
     float z = math.log(K / S) / sda
-    float r = z < 0 ? 1 + pA * z + pB * z * z : 1 + cA * z + cB * z * z
+    float r = z < 0 ? 1 + a1 * z + b1 * z * z : 1 + a2 * z + b2 * z * z
     sda * math.max(r, 0.4)
 
-f_opt(float S, float K, float sda, bool isCall) =>
+f_opt(float S, float K, float sda, bool isCall, float ml) =>
     float res = isCall ? math.max(S - K, 0) : math.max(K - S, 0)
     if sda > 1e-6
-        float sd = f_sdK(S, K, sda)
+        float sd = f_sdK(S, K, sda, ml)
         float d1 = (math.log(S / K) + 0.5 * sd * sd) / sd
         float d2 = d1 - sd
         res := isCall ? S * f_ncdf(d1) - K * f_ncdf(d2) : K * f_ncdf(-d2) - S * f_ncdf(-d1)
     res
 
-f_delta(float S, float K, float sda, bool isCall) =>
-    float sd = f_sdK(S, K, sda)
+f_delta(float S, float K, float sda, bool isCall, float ml) =>
+    float sd = f_sdK(S, K, sda, ml)
     float d1 = (math.log(S / K) + 0.5 * sd * sd) / sd
     isCall ? f_ncdf(d1) : f_ncdf(d1) - 1
 
-f_vert(float S, float kShort, float kLong, float sda, bool isCall) =>
-    f_opt(S, kShort, sda, isCall) - f_opt(S, kLong, sda, isCall)
+f_vert(float S, float kShort, float kLong, float sda, bool isCall, float ml) =>
+    f_opt(S, kShort, sda, isCall, ml) - f_opt(S, kLong, sda, isCall, ml)
 
-f_findPut(float S, float sda) =>
+f_findPut(float S, float sda, float ml) =>
     float k = math.floor(S / strikeInc) * strikeInc
     int i = 0
-    while math.abs(f_delta(S, k, sda, false)) > putDelta and i < 400
+    while math.abs(f_delta(S, k, sda, false, ml)) > putDelta and i < 400
         k -= strikeInc
         i += 1
     k
 
-f_findCall(float S, float sda) =>
+f_findCall(float S, float sda, float ml) =>
     float k = math.ceil(S / strikeInc) * strikeInc
     int i = 0
-    while f_delta(S, k, sda, true) > callDelta and i < 400
+    while f_delta(S, k, sda, true, ml) > callDelta and i < 400
         k += strikeInc
         i += 1
     k
@@ -266,11 +302,11 @@ if inRth
         float sdaC = f_sda(ivNow, minsLeftC)
         for i = 0 to n - 1
             if na(array.get(oExP, i))
-                float v = f_vert(close, array.get(oKp, i), array.get(oKp, i) - width, sdaC, false)
+                float v = f_vert(close, array.get(oKp, i), array.get(oKp, i) - width, sdaC, false, minsLeftC)
                 if v >= stopMult * array.get(oCrP, i)
                     array.set(oExP, i, math.min(width, v + fillSlip))
             if na(array.get(oExC, i))
-                float v = f_vert(close, array.get(oKc, i), array.get(oKc, i) + width, sdaC, true)
+                float v = f_vert(close, array.get(oKc, i), array.get(oKc, i) + width, sdaC, true, minsLeftC)
                 if v >= stopMult * array.get(oCrC, i)
                     array.set(oExC, i, math.min(width, v + fillSlip))
     // 2) new condor at the start of each slot, priced at this bar's open
@@ -278,10 +314,10 @@ if inRth
     if not newRth and mOpen > 570 and (mOpen - 570) % bucketMins == 0 and minsLeftO >= minMinsLeft and not na(ivPrev) and ivPrev > 0
         float S   = open
         float sda = f_sda(ivPrev, minsLeftO)
-        float kp  = f_findPut(S, sda)
-        float kc  = f_findCall(S, sda)
-        float crP = f_vert(S, kp, kp - width, sda, false) - fillSlip
-        float crC = f_vert(S, kc, kc + width, sda, true) - fillSlip
+        float kp  = f_findPut(S, sda, minsLeftO)
+        float kc  = f_findCall(S, sda, minsLeftO)
+        float crP = f_vert(S, kp, kp - width, sda, false, minsLeftO) - fillSlip
+        float crC = f_vert(S, kc, kc + width, sda, true, minsLeftO) - fillSlip
         if crP > 0 and crC > 0 and crP + crC >= minCredit
             int b = int(math.floor((mOpen - 570) / bucketMins))
             array.push(oB, b)
@@ -317,11 +353,12 @@ float pvCr = na
 float pvCrP = na
 float pvCrC = na
 if barstate.islast and inRth and 960 - mClose >= minMinsLeft and not na(ivNow)
-    float sdaN = f_sda(ivNow, 960 - mClose)
-    pvKp := f_findPut(close, sdaN)
-    pvKc := f_findCall(close, sdaN)
-    pvCrP := f_vert(close, pvKp, pvKp - width, sdaN, false) - fillSlip
-    pvCrC := f_vert(close, pvKc, pvKc + width, sdaN, true) - fillSlip
+    float mlN  = 960 - mClose
+    float sdaN = f_sda(ivNow, mlN)
+    pvKp := f_findPut(close, sdaN, mlN)
+    pvKc := f_findCall(close, sdaN, mlN)
+    pvCrP := f_vert(close, pvKp, pvKp - width, sdaN, false, mlN) - fillSlip
+    pvCrC := f_vert(close, pvKc, pvKc + width, sdaN, true, mlN) - fillSlip
     pvCr := pvCrP + pvCrC
 
 if barstate.islast and showLines
@@ -458,4 +495,4 @@ if barstate.islast
         r += 1
 
     string warn = not timeframe.isintraday or timeframe.in_seconds() > bucketMins * 60 ? "⚠ Use an intraday chart ≤ slot size (15m recommended).  " : ""
-    f_wide(r, warn + str.tostring(days) + " sessions · " + str.tostring(putDelta * 100, "#") + "Δ put / " + str.tostring(callDelta * 100, "#") + "Δ call · " + str.tostring(width, "#") + "-wide · fill mid−" + str.tostring(fillSlip) + "/side · $" + str.tostring(feeContract) + "/contract · " + (stopMult > 0 ? "stop " + str.tostring(stopMult) + "× credit" : "held to close"), color.new(color.white, 45), color.new(#0e1117, 100))
+    f_wide(r, warn + str.tostring(days) + " sessions · " + str.tostring(putDelta * 100, "#") + "Δ put / " + str.tostring(callDelta * 100, "#") + "Δ call · " + str.tostring(width, "#") + "-wide · " + (useTod ? "time-of-day pricing" : "FLAT pricing") + (volScale != 1.0 ? " ×" + str.tostring(volScale) : "") + " · fill mid−" + str.tostring(fillSlip) + "/side · $" + str.tostring(feeContract) + "/contract · " + (stopMult > 0 ? "stop " + str.tostring(stopMult) + "× credit" : "held to close"), color.new(color.white, 45), color.new(#0e1117, 100))
