@@ -1,0 +1,462 @@
+// This Pine Script® code is subject to the terms of the MIT License.
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  GEX × THE STRAT — 0DTE SPX Credit Spread Toolkit
+//
+//  What it does
+//   • GEX map:      Call Wall / Put Wall / Zero-Gamma flip / HVL + extra nodes,
+//                   auto-converted from SPX to SPY / ES / XSP charts.
+//   • Gamma regime: positive γ (dealers dampen → pin, sell both sides) vs
+//                   negative γ (dealers amplify → trend, go one-sided or sit out).
+//   • The Strat:    1 / 2U / 2D / 3 bar typing, 2-1-2, 3-1-2, 2-2, 3-2-2,
+//                   1-2-2 RevStrat combos, inside-bar triggers, hammers/shooters,
+//                   Full Timeframe Continuity across 5 timeframes.
+//   • 0DTE context: VIX1D expected move (day + time-decayed remaining 1σ),
+//                   opening range, prior-day RTH H/L/C, session VWAP (uses SPY
+//                   volume as a proxy because SPX has none), entry window and
+//                   late-day gamma danger zone.
+//   • Engine:       a directional score → BULL PUT / BEAR CALL / IRON CONDOR /
+//                   STAND ASIDE, with suggested short/long strikes that sit
+//                   beyond BOTH the remaining expected move AND the GEX wall.
+//   • Risk:         enter your live short strikes and it warns you when price
+//                   gets within N points.
+//
+//  GEX levels can't be computed in Pine (no options chain access). Paste them in
+//  each morning from your GEX provider. Not financial advice.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("GEX × The Strat — 0DTE SPX Credit Spreads", shorttitle = "GEX×STRAT 0DTE", overlay = true, max_lines_count = 200, max_labels_count = 300)
+
+string TZ = "America/New_York"
+
+// ───────────────────────────── ① GEX levels ─────────────────────────────
+string G_GEX = "① GEX levels (update every morning)"
+string levelsUnit = input.string("SPX", "Levels are quoted in", options = ["SPX", "Chart symbol"], group = G_GEX, tooltip = "SPX = enter SPX strikes and they'll be auto-scaled onto SPY / ES / XSP charts using the live ratio to SPX. Chart symbol = levels are already in the chart's price units.")
+float callWall  = input.float(0.0, "Call Wall (resistance)", step = 5, group = G_GEX, tooltip = "Largest positive call gamma strike. 0 = off.")
+float putWall   = input.float(0.0, "Put Wall (support)", step = 5, group = G_GEX, tooltip = "Largest put gamma strike. 0 = off.")
+float zeroGamma = input.float(0.0, "Zero Gamma / Gamma Flip", step = 5, group = G_GEX, tooltip = "Price where net dealer gamma flips sign. Above = positive γ (pinning), below = negative γ (trending). 0 = off.")
+float hvl       = input.float(0.0, "HVL / Vol Trigger (optional)", step = 5, group = G_GEX, tooltip = "Used as the regime pivot if Zero Gamma is blank. 0 = off.")
+string extraStr = input.string("", "Extra gamma nodes (comma-separated)", group = G_GEX, tooltip = "e.g. 5850, 5875, 5925")
+string spxSym   = input.symbol("SP:SPX", "SPX reference symbol", group = G_GEX)
+bool showGex    = input.bool(true, "Draw GEX levels", group = G_GEX)
+
+// ───────────────────────────── ② The Strat ─────────────────────────────
+string G_STRAT = "② The Strat"
+bool colorBars    = input.bool(true, "Color bars by Strat type", group = G_STRAT, tooltip = "Yellow = 1 (inside), Purple = 3 (outside), Green = 2U, Red = 2D")
+bool showCombos   = input.bool(true, "Label combos (2-1-2, 3-1-2, 2-2, 3-2-2, 1-2-2)", group = G_STRAT)
+bool showTriggers = input.bool(true, "Inside-bar trigger lines", group = G_STRAT)
+bool showShooters = input.bool(true, "Mark hammers / shooters", group = G_STRAT)
+string tf1 = input.timeframe("W",  "FTFC timeframe 1", group = G_STRAT, inline = "tf")
+string tf2 = input.timeframe("D",  "2", group = G_STRAT, inline = "tf")
+string tf3 = input.timeframe("60", "3", group = G_STRAT, inline = "tf")
+string tf4 = input.timeframe("30", "FTFC timeframe 4", group = G_STRAT, inline = "tf2")
+string tf5 = input.timeframe("15", "5", group = G_STRAT, inline = "tf2")
+int minFtfc   = input.int(3, "Min FTFC agreement for entry signals (of 5)", minval = 0, maxval = 5, group = G_STRAT)
+int sigMemory = input.int(6, "Combo stays 'fresh' for N bars", minval = 1, group = G_STRAT)
+
+// ──────────────────── ③ Session, expected move, levels ────────────────────
+string G_DAY = "③ Session, expected move & key levels"
+string ivSym    = input.symbol("CBOE:VIX1D", "0DTE implied-vol index", group = G_DAY, tooltip = "VIX1D = 1-day implied vol, the right gauge for 0DTE. Falls back to TVC:VIX if unavailable on your data plan.")
+string emAnchor = input.string("RTH open", "Expected-move anchor", options = ["RTH open", "Prior close"], group = G_DAY)
+bool showEM     = input.bool(true, "Expected-move bands (±1σ day)", group = G_DAY)
+bool showOR     = input.bool(true, "Opening range", group = G_DAY, inline = "or")
+int orMins      = input.int(15, "minutes", options = [5, 15, 30, 60], group = G_DAY, inline = "or")
+bool showPD     = input.bool(true, "Prior-day RTH high / low / close", group = G_DAY)
+bool showVWAP   = input.bool(true, "Session VWAP", group = G_DAY)
+string volSym   = input.symbol("AMEX:SPY", "VWAP volume proxy", group = G_DAY, tooltip = "SPX is an index with no volume. When the chart has no volume, this symbol's volume weights the VWAP.")
+
+// ───────────────────────── ④ Credit spread engine ─────────────────────────
+string G_CS = "④ Credit spread engine"
+float strikeStep  = input.float(5, "Strike increment", minval = 0.5, step = 0.5, group = G_CS, tooltip = "In the same units as your levels (5 for SPX, 1 for SPY/XSP).")
+float spreadWidth = input.float(10, "Spread width", minval = 0.5, step = 0.5, group = G_CS)
+float emMult      = input.float(1.0, "Short strike ≥ N × remaining 1σ away", minval = 0.1, step = 0.1, group = G_CS)
+float wallBuffer  = input.float(5, "Extra buffer beyond GEX wall", minval = 0, step = 1, group = G_CS)
+string entrySess  = input.session("1000-1400", "Entry window (ET)", group = G_CS, tooltip = "Skip the open's price discovery and the last hours when 0DTE gamma explodes.")
+string dangerSess = input.session("1500-1600", "Gamma danger zone (ET)", group = G_CS)
+int biasThresh    = input.int(3, "Score needed for a one-sided spread", minval = 1, maxval = 9, group = G_CS, tooltip = "Score ranges −10…+10. In negative gamma, 2 extra points are required.")
+float myPut       = input.float(0.0, "My open short PUT strike (0 = none)", step = 5, group = G_CS)
+float myCall      = input.float(0.0, "My open short CALL strike (0 = none)", step = 5, group = G_CS)
+float defendPts   = input.float(10, "Warn when within N points of my short strike", minval = 0, group = G_CS)
+bool showStrikes  = input.bool(true, "Draw suggested short strikes", group = G_CS)
+
+// ─────────────────────────────── ⑤ Display ───────────────────────────────
+string G_UI = "⑤ Display"
+bool showTable    = input.bool(true, "Dashboard", group = G_UI)
+string tblPosIn   = input.string("Top right", "Dashboard position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = G_UI)
+string tblSizeIn  = input.string("Small", "Dashboard text", options = ["Tiny", "Small", "Normal"], group = G_UI)
+bool shadeRegime  = input.bool(true, "Shade negative-gamma bars", group = G_UI)
+bool shadeDanger  = input.bool(true, "Shade gamma danger zone", group = G_UI)
+
+// ═════════════════════════════ Helpers ═════════════════════════════
+f_type() =>
+    int t = 1
+    if high > high[1] and low < low[1]
+        t := 3
+    else if high > high[1]
+        t := 2
+    else if low < low[1]
+        t := -2
+    t
+
+f_typeStr(int t) =>
+    na(t) ? "—" : t == 3 ? "3" : t == 2 ? "2U" : t == -2 ? "2D" : "1"
+
+f_open(string tf) =>
+    request.security(syminfo.tickerid, tf, open, lookahead = barmerge.lookahead_on)
+
+f_dir(float o) =>
+    na(o) ? 0 : close > o ? 1 : close < o ? -1 : 0
+
+f_arrow(int d) =>
+    d > 0 ? "▲" : d < 0 ? "▼" : "•"
+
+f_num(float x) =>
+    na(x) ? "—" : str.tostring(x, "#.##")
+
+f_signed(float x) =>
+    na(x) ? "—" : (x >= 0 ? "+" : "") + str.tostring(x, "#.##")
+
+f_floorStep(float x, float step) =>
+    na(x) ? na : math.floor(x / step) * step
+
+f_ceilStep(float x, float step) =>
+    na(x) ? na : math.ceil(x / step) * step
+
+// ═════════════════════════════ Session ═════════════════════════════
+bool inRth  = not na(time(timeframe.period, "0930-1600", TZ))
+bool newRth = inRth and not inRth[1]
+string orSess = switch orMins
+    5  => "0930-0935"
+    15 => "0930-0945"
+    30 => "0930-1000"
+    => "0930-1030"
+bool inOR     = not na(time(timeframe.period, orSess, TZ))
+bool inWindow = not na(time(timeframe.period, entrySess, TZ))
+bool inDanger = not na(time(timeframe.period, dangerSess, TZ))
+
+// ═════════════════════════ SPX → chart conversion ═════════════════════════
+float spxC     = request.security(spxSym, timeframe.period, close, ignore_invalid_symbol = true)
+bool chartIsSpx = syminfo.ticker == "SPX"
+var float ratio = 1.0
+// Lock the ratio on RTH bars only so ES overnight drift doesn't distort levels.
+if levelsUnit == "SPX" and not chartIsSpx and inRth and not na(spxC) and spxC > 0
+    ratio := close / spxC
+
+f_toChart(float x) =>
+    x > 0 ? x * ratio : na
+
+float cwC   = f_toChart(callWall)
+float pwC   = f_toChart(putWall)
+float zgC   = f_toChart(zeroGamma)
+float hvlC  = f_toChart(hvl)
+float flipC = not na(zgC) ? zgC : hvlC
+float pxL   = close / ratio           // price in level units (SPX if levels are SPX)
+float flipL = zeroGamma > 0 ? zeroGamma : hvl > 0 ? hvl : na
+
+int gRegime = na(flipC) ? 0 : close >= flipC ? 1 : -1
+
+// ═════════════════════════════ The Strat ═════════════════════════════
+int t0 = f_type()
+int t1 = t0[1]
+int t2 = t0[2]
+
+bool c212Bull = t1 == 1 and math.abs(t2) == 2 and t0 == 2
+bool c212Bear = t1 == 1 and math.abs(t2) == 2 and t0 == -2
+bool c312Bull = t2 == 3 and t1 == 1 and t0 == 2
+bool c312Bear = t2 == 3 and t1 == 1 and t0 == -2
+bool c322Bull = t2 == 3 and t1 == -2 and t0 == 2
+bool c322Bear = t2 == 3 and t1 == 2 and t0 == -2
+bool c122Bull = t2 == 1 and t1 == -2 and t0 == 2
+bool c122Bear = t2 == 1 and t1 == 2 and t0 == -2
+bool c22Bull  = t1 == -2 and t0 == 2 and t2 != 1 and t2 != 3
+bool c22Bear  = t1 == 2 and t0 == -2 and t2 != 1 and t2 != 3
+
+string bullName = c312Bull ? "3-1-2" : c212Bull ? (t2 == 2 ? "2-1-2 cont" : "2-1-2 rev") : c322Bull ? "3-2-2 rev" : c122Bull ? "1-2-2 RevStrat" : c22Bull ? "2-2 rev" : ""
+string bearName = c312Bear ? "3-1-2" : c212Bear ? (t2 == -2 ? "2-1-2 cont" : "2-1-2 rev") : c322Bear ? "3-2-2 rev" : c122Bear ? "1-2-2 RevStrat" : c22Bear ? "2-2 rev" : ""
+bool stratBull = bullName != "" and barstate.isconfirmed
+bool stratBear = bearName != "" and barstate.isconfirmed
+
+float rng     = high - low
+bool hammer   = rng > 0 and (math.min(open, close) - low) >= 0.6 * rng and barstate.isconfirmed
+bool shooter  = rng > 0 and (high - math.max(open, close)) >= 0.6 * rng and barstate.isconfirmed
+
+var string lastSig = "—"
+var int lastSigDir = 0
+var int lastSigBar = na
+if stratBull
+    lastSig    := bullName + " ▲"
+    lastSigDir := 1
+    lastSigBar := bar_index
+else if stratBear
+    lastSig    := bearName + " ▼"
+    lastSigDir := -1
+    lastSigBar := bar_index
+bool sigFresh = not na(lastSigBar) and bar_index - lastSigBar <= sigMemory
+
+// Full Timeframe Continuity
+int d1 = f_dir(f_open(tf1))
+int d2 = f_dir(f_open(tf2))
+int d3 = f_dir(f_open(tf3))
+int d4 = f_dir(f_open(tf4))
+int d5 = f_dir(f_open(tf5))
+int ftfcScore = d1 + d2 + d3 + d4 + d5
+
+int dType = request.security(syminfo.tickerid, "D", f_type())
+int hType = request.security(syminfo.tickerid, "60", f_type())
+
+// ═════════════════════ Implied vol & expected move ═════════════════════
+float ivMain = request.security(ivSym, timeframe.period, close, ignore_invalid_symbol = true)
+float ivBack = request.security("TVC:VIX", timeframe.period, close, ignore_invalid_symbol = true)
+float iv     = not na(ivMain) ? ivMain : ivBack
+string ivName = not na(ivMain) ? "VIX1D" : "VIX*"
+
+// ═════════════════════ RTH tracking: PD levels, OR, VWAP, EM ═════════════════════
+var float rthH = na
+var float rthL = na
+var float pdH = na
+var float pdL = na
+var float pdC = na
+var float lastRthClose = na
+var float orH = na
+var float orL = na
+var int sessStartBar = na
+var float emBase = na
+var float emDay = na
+var float cumPV = 0.0
+var float cumV = 0.0
+
+if newRth
+    pdH := rthH
+    pdL := rthL
+    pdC := lastRthClose
+    rthH := high
+    rthL := low
+    orH := high
+    orL := low
+    sessStartBar := bar_index
+    cumPV := 0.0
+    cumV := 0.0
+    float anchor = emAnchor == "Prior close" and not na(pdC) ? pdC : open
+    emBase := anchor
+    emDay := na(iv) ? na : anchor * iv / 100 / math.sqrt(252)
+else if inRth
+    rthH := math.max(rthH, high)
+    rthL := math.min(rthL, low)
+    if inOR
+        orH := math.max(orH, high)
+        orL := math.min(orL, low)
+if inRth
+    lastRthClose := close
+    if na(emDay) and not na(iv) and not na(emBase)
+        emDay := emBase * iv / 100 / math.sqrt(252)
+
+float proxyV   = request.security(volSym, timeframe.period, volume, ignore_invalid_symbol = true)
+bool chartHasV = not na(volume) and volume > 0
+float vUse     = chartHasV ? volume : nz(proxyV)
+if inRth
+    cumPV += hlc3 * vUse
+    cumV  += vUse
+float vwapV = inRth and cumV > 0 ? cumPV / cumV : na
+
+bool orDone = inRth and not inOR and not na(orH)
+
+// Remaining 1σ move for the rest of today (√time decay of the day's move)
+int nowMin     = hour(time_close, TZ) * 60 + minute(time_close, TZ)
+float minsLeft = nowMin >= 960 or nowMin < 570 ? 390.0 : math.max(960 - nowMin, 1)
+float remEM    = na(iv) ? na : close * iv / 100 * math.sqrt(minsLeft / (252.0 * 390.0))
+float remEML   = na(remEM) ? na : remEM / ratio
+
+// ═════════════════════════ Bias score ═════════════════════════
+int sVwap = na(vwapV) ? 0 : close > vwapV ? 1 : -1
+int sOR   = not orDone ? 0 : close > orH ? 1 : close < orL ? -1 : 0
+int sFlip = gRegime
+int sSig  = sigFresh ? 2 * lastSigDir : 0
+int score = ftfcScore + sVwap + sOR + sFlip + sSig      // −10 … +10
+
+bool betweenWalls = (na(pwC) or close > pwC) and (na(cwC) or close < cwC)
+int need = gRegime < 0 ? biasThresh + 2 : biasThresh
+
+string bias = "STAND ASIDE"
+color biasCol = color.gray
+if not inRth
+    bias    := "MARKET CLOSED"
+    biasCol := color.gray
+else if not inWindow
+    bias    := inDanger ? "NO NEW RISK — γ DANGER" : "WAIT — OUTSIDE WINDOW"
+    biasCol := inDanger ? color.orange : color.gray
+else if score >= need
+    bias    := "BULL PUT SPREAD"
+    biasCol := color.lime
+else if score <= -need
+    bias    := "BEAR CALL SPREAD"
+    biasCol := color.red
+else if gRegime >= 0 and betweenWalls and math.abs(score) <= 2
+    bias    := "IRON CONDOR"
+    biasCol := color.aqua
+
+// ═════════════════════════ Strike engine (level units) ═════════════════════════
+float emDist     = na(remEML) ? na : remEML * emMult
+float putEm      = na(emDist) ? na : pxL - emDist
+float callEm     = na(emDist) ? na : pxL + emDist
+float putWallRef = putWall > 0 and putWall < pxL ? putWall - wallBuffer : na
+float callWallRef = callWall > 0 and callWall > pxL ? callWall + wallBuffer : na
+float putShort   = f_floorStep(na(putWallRef) ? putEm : na(putEm) ? putWallRef : math.min(putEm, putWallRef), strikeStep)
+float callShort  = f_ceilStep(na(callWallRef) ? callEm : na(callEm) ? callWallRef : math.max(callEm, callWallRef), strikeStep)
+float putLong    = na(putShort) ? na : putShort - spreadWidth
+float callLong   = na(callShort) ? na : callShort + spreadWidth
+
+// ═════════════════════════ Entry signals ═════════════════════════
+bool pcsEntry = stratBull and inWindow and ftfcScore >= minFtfc and (na(pwC) or close > pwC)
+bool ccsEntry = stratBear and inWindow and ftfcScore <= -minFtfc and (na(cwC) or close < cwC)
+
+// ═════════════════════════ Position defense ═════════════════════════
+float myPutC    = f_toChart(myPut)
+float myCallC   = f_toChart(myCall)
+bool putDanger  = not na(myPutC) and close - myPutC <= defendPts * ratio
+bool callDanger = not na(myCallC) and myCallC - close <= defendPts * ratio
+
+// computed unconditionally: Pine v6 `and` is lazy, ta.* must run every bar
+bool xUp = ta.crossover(close, flipC)
+bool xDn = ta.crossunder(close, flipC)
+bool flipUp = not na(flipC) and xUp
+bool flipDn = not na(flipC) and xDn
+
+// ═════════════════════════════ Plots ═════════════════════════════
+color stratCol = t0 == 1 ? #f4d03f : t0 == 3 ? #9b59b6 : t0 == 2 ? #26a69a : #ef5350
+barcolor(colorBars ? stratCol : na, title = "Strat bar color")
+
+bgcolor(shadeRegime and inRth and gRegime < 0 ? color.new(color.red, 94) : na, title = "Negative gamma")
+bgcolor(shadeDanger and inDanger ? color.new(color.orange, 90) : na, title = "Gamma danger zone")
+
+plot(showEM and inRth and not na(emDay) ? emBase + emDay : na, "EM +1σ", color.new(#ab47bc, 0), 1, plot.style_linebr)
+plot(showEM and inRth and not na(emDay) ? emBase - emDay : na, "EM −1σ", color.new(#ab47bc, 0), 1, plot.style_linebr)
+plot(showEM and inRth and not na(emDay) ? emBase : na, "EM anchor", color.new(#ab47bc, 70), 1, plot.style_linebr)
+
+plot(showOR and orDone ? orH : na, "OR high", color.new(#ffa726, 0), 1, plot.style_linebr)
+plot(showOR and orDone ? orL : na, "OR low", color.new(#ffa726, 0), 1, plot.style_linebr)
+
+plot(showPD and inRth ? pdH : na, "Prior-day high", color.new(#90a4ae, 30), 1, plot.style_linebr)
+plot(showPD and inRth ? pdL : na, "Prior-day low", color.new(#90a4ae, 30), 1, plot.style_linebr)
+plot(showPD and inRth ? pdC : na, "Prior-day close", color.new(#90a4ae, 60), 1, plot.style_linebr)
+
+plot(showVWAP ? vwapV : na, "VWAP", color.new(#29b6f6, 0), 2, plot.style_linebr)
+
+plot(showTriggers and t1 == 1 ? high[1] : na, "Inside-bar 2U trigger", color.new(#26a69a, 0), 1, plot.style_linebr)
+plot(showTriggers and t1 == 1 ? low[1] : na, "Inside-bar 2D trigger", color.new(#ef5350, 0), 1, plot.style_linebr)
+
+plotshape(showShooters and hammer, "Hammer", shape.circle, location.belowbar, color.new(#26a69a, 30), size = size.tiny)
+plotshape(showShooters and shooter, "Shooter", shape.circle, location.abovebar, color.new(#ef5350, 30), size = size.tiny)
+
+plotshape(pcsEntry, "PCS setup", shape.triangleup, location.belowbar, color.lime, text = "PCS", textcolor = color.lime, size = size.small)
+plotshape(ccsEntry, "CCS setup", shape.triangledown, location.abovebar, color.red, text = "CCS", textcolor = color.red, size = size.small)
+
+if showCombos and stratBull and not pcsEntry
+    label.new(bar_index, low, bullName, style = label.style_label_up, color = color.new(#26a69a, 70), textcolor = color.white, size = size.tiny)
+if showCombos and stratBear and not ccsEntry
+    label.new(bar_index, high, bearName, style = label.style_label_down, color = color.new(#ef5350, 70), textcolor = color.white, size = size.tiny)
+if flipUp and barstate.isconfirmed
+    label.new(bar_index, low, "γ+ flip", style = label.style_label_up, color = color.new(color.aqua, 40), textcolor = color.black, size = size.tiny)
+if flipDn and barstate.isconfirmed
+    label.new(bar_index, high, "γ− flip", style = label.style_label_down, color = color.new(color.orange, 40), textcolor = color.black, size = size.tiny)
+
+// ─────────────── Today's levels as right-extended lines ───────────────
+var array<line> lvlLines = array.new<line>()
+var array<label> lvlLabels = array.new<label>()
+
+f_draw(float y, string txt, color col, string sty, int w, int x1, int x2) =>
+    if not na(y)
+        array.push(lvlLines, line.new(x1, y, x2, y, color = col, style = sty, width = w))
+        array.push(lvlLabels, label.new(x2, y, txt, style = label.style_label_left, color = color.new(col, 80), textcolor = col, size = size.small))
+
+if barstate.islast
+    for l in lvlLines
+        line.delete(l)
+    array.clear(lvlLines)
+    for lb in lvlLabels
+        label.delete(lb)
+    array.clear(lvlLabels)
+    int x1 = na(sessStartBar) ? math.max(0, bar_index - 50) : sessStartBar
+    int x2 = bar_index + 10
+    if showGex
+        f_draw(cwC, "Call Wall " + f_num(callWall), color.red, line.style_solid, 2, x1, x2)
+        f_draw(pwC, "Put Wall " + f_num(putWall), color.lime, line.style_solid, 2, x1, x2)
+        f_draw(zgC, "Zero γ " + f_num(zeroGamma), color.yellow, line.style_dashed, 2, x1, x2)
+        f_draw(hvlC, "HVL " + f_num(hvl), color.orange, line.style_dashed, 1, x1, x2)
+        if str.length(extraStr) > 0
+            for p in str.split(extraStr, ",")
+                float v = str.tonumber(str.replace_all(p, " ", ""))
+                if not na(v) and v > 0
+                    f_draw(v * ratio, "γ node " + f_num(v), color.gray, line.style_dotted, 1, x1, x2)
+    if showStrikes and inRth
+        f_draw(na(putShort) ? na : putShort * ratio, "PCS short " + f_num(putShort), color.new(color.lime, 30), line.style_dotted, 1, x1, x2)
+        f_draw(na(callShort) ? na : callShort * ratio, "CCS short " + f_num(callShort), color.new(color.red, 30), line.style_dotted, 1, x1, x2)
+    f_draw(myPutC, "MY short put " + f_num(myPut), putDanger ? color.orange : color.teal, line.style_solid, 3, x1, x2)
+    f_draw(myCallC, "MY short call " + f_num(myCall), callDanger ? color.orange : color.maroon, line.style_solid, 3, x1, x2)
+
+// ═════════════════════════════ Dashboard ═════════════════════════════
+string tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+string tsz = tblSizeIn == "Tiny" ? size.tiny : tblSizeIn == "Normal" ? size.normal : size.small
+
+var table tb = table.new(tblPos, 2, 18, bgcolor = color.new(#0e1117, 8), frame_color = color.new(#3a3f4b, 0), frame_width = 1, border_color = color.new(#2a2e39, 0), border_width = 1)
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(tb, 0, r, k, text_color = color.new(color.white, 35), text_size = tsz, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, text_color = vc, text_size = tsz, text_halign = text.align_right)
+
+if barstate.islast and showTable
+    string unit = levelsUnit == "SPX" ? " (SPX)" : ""
+    table.cell(tb, 0, 0, "GEX × STRAT · 0DTE", text_color = color.white, text_size = tsz, text_halign = text.align_left)
+    table.cell(tb, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = color.new(color.white, 35), text_size = tsz, text_halign = text.align_right)
+
+    string regTxt = gRegime > 0 ? "POSITIVE γ — pin / fade" : gRegime < 0 ? "NEGATIVE γ — trend / expand" : "enter Zero γ level"
+    color regCol = gRegime > 0 ? color.lime : gRegime < 0 ? color.red : color.gray
+    f_row(1, "Gamma regime", regTxt, regCol)
+    f_row(2, "Flip" + unit, na(flipL) ? "—" : f_num(flipL) + "  (" + f_signed(pxL - flipL) + ")", color.yellow)
+    f_row(3, "Call Wall" + unit, callWall > 0 ? f_num(callWall) + "  (" + f_signed(callWall - pxL) + ")" : "—", color.red)
+    f_row(4, "Put Wall" + unit, putWall > 0 ? f_num(putWall) + "  (" + f_signed(putWall - pxL) + ")" : "—", color.lime)
+
+    string ftfcTxt = tf1 + f_arrow(d1) + " " + tf2 + f_arrow(d2) + " " + tf3 + f_arrow(d3) + " " + tf4 + f_arrow(d4) + " " + tf5 + f_arrow(d5) + "  (" + f_signed(ftfcScore) + ")"
+    color ftfcCol = ftfcScore == 5 ? color.lime : ftfcScore == -5 ? color.red : ftfcScore > 0 ? color.new(color.lime, 40) : ftfcScore < 0 ? color.new(color.red, 40) : color.gray
+    f_row(5, "FTFC", ftfcTxt, ftfcCol)
+    f_row(6, "Strat D · 60 · now", f_typeStr(dType) + " · " + f_typeStr(hType) + " · " + f_typeStr(t0), color.white)
+    string sigTxt = na(lastSigBar) ? "—" : lastSig + "  " + str.tostring(bar_index - lastSigBar) + " bars ago"
+    f_row(7, "Last combo", sigTxt, lastSigDir > 0 ? color.lime : lastSigDir < 0 ? color.red : color.gray)
+
+    f_row(8, "1σ day move", na(emDay) ? "no IV data" : "±" + f_num(emDay / ratio) + "  (" + ivName + " " + f_num(iv) + ")", color.new(#ce93d8, 0))
+    f_row(9, "Remaining 1σ", na(remEML) ? "—" : "±" + f_num(remEML) + "  (" + str.tostring(math.round(minsLeft)) + "m left)", color.new(#ce93d8, 0))
+    f_row(10, "VWAP", na(vwapV) ? "no volume" : close > vwapV ? "above" : "below", sVwap > 0 ? color.lime : sVwap < 0 ? color.red : color.gray)
+    string orTxt = not orDone ? "forming / closed" : close > orH ? "above ORH" : close < orL ? "below ORL" : "inside OR"
+    f_row(11, "Opening range " + str.tostring(orMins) + "m", orTxt, sOR > 0 ? color.lime : sOR < 0 ? color.red : color.gray)
+    string clockTxt = not inRth ? "closed" : inDanger ? "γ DANGER ZONE" : inWindow ? "entry window OPEN" : "outside window"
+    f_row(12, "Clock (ET)", clockTxt, inDanger ? color.orange : inWindow ? color.lime : color.gray)
+
+    f_row(13, "Score (need ±" + str.tostring(need) + ")", f_signed(score), score > 0 ? color.lime : score < 0 ? color.red : color.gray)
+    table.cell(tb, 0, 14, "BIAS", text_color = color.white, text_size = tsz, text_halign = text.align_left)
+    table.cell(tb, 1, 14, bias, text_color = color.black, bgcolor = biasCol, text_size = tsz, text_halign = text.align_center)
+    f_row(15, "Put spread idea" + unit, na(putShort) ? "—" : "sell " + f_num(putShort) + " / buy " + f_num(putLong) + "  (" + f_signed(putShort - pxL) + ")", color.lime)
+    f_row(16, "Call spread idea" + unit, na(callShort) ? "—" : "sell " + f_num(callShort) + " / buy " + f_num(callLong) + "  (" + f_signed(callShort - pxL) + ")", color.red)
+    string myTxt = (myPut > 0 ? "P " + f_signed(pxL - myPut) : "P —") + "   " + (myCall > 0 ? "C " + f_signed(myCall - pxL) : "C —")
+    f_row(17, "My cushion", myTxt, putDanger or callDanger ? color.orange : color.white)
+
+// ═════════════════════════════ Alerts ═════════════════════════════
+alertcondition(pcsEntry, "PCS setup", "GEX×STRAT: bull put spread setup on {{ticker}} @ {{close}}")
+alertcondition(ccsEntry, "CCS setup", "GEX×STRAT: bear call spread setup on {{ticker}} @ {{close}}")
+alertcondition(flipUp, "Gamma flip ↑ (into positive γ)", "{{ticker}} crossed ABOVE zero gamma @ {{close}}")
+alertcondition(flipDn, "Gamma flip ↓ (into negative γ)", "{{ticker}} crossed BELOW zero gamma @ {{close}} — expect expansion")
+alertcondition(putDanger and not putDanger[1], "Short put threatened", "{{ticker}} within defend distance of your short put @ {{close}}")
+alertcondition(callDanger and not callDanger[1], "Short call threatened", "{{ticker}} within defend distance of your short call @ {{close}}")
+alertcondition(stratBull, "Strat bullish combo", "{{ticker}} bullish Strat combo @ {{close}}")
+alertcondition(stratBear, "Strat bearish combo", "{{ticker}} bearish Strat combo @ {{close}}")
+
+if pcsEntry
+    alert("PCS setup (" + bullName + ") on " + syminfo.ticker + " — idea: sell " + f_num(putShort) + " / buy " + f_num(putLong) + " puts. Score " + f_signed(score) + ", FTFC " + f_signed(ftfcScore) + ", " + (gRegime > 0 ? "positive γ" : gRegime < 0 ? "NEGATIVE γ" : "γ n/a"), alert.freq_once_per_bar_close)
+if ccsEntry
+    alert("CCS setup (" + bearName + ") on " + syminfo.ticker + " — idea: sell " + f_num(callShort) + " / buy " + f_num(callLong) + " calls. Score " + f_signed(score) + ", FTFC " + f_signed(ftfcScore) + ", " + (gRegime > 0 ? "positive γ" : gRegime < 0 ? "NEGATIVE γ" : "γ n/a"), alert.freq_once_per_bar_close)
+if putDanger and not putDanger[1]
+    alert("DEFEND: " + syminfo.ticker + " is " + f_num(pxL - myPut) + " pts from your " + f_num(myPut) + " short put", alert.freq_once_per_bar)
+if callDanger and not callDanger[1]
+    alert("DEFEND: " + syminfo.ticker + " is " + f_num(myCall - pxL) + " pts from your " + f_num(myCall) + " short call", alert.freq_once_per_bar)
