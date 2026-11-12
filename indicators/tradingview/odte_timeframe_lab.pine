@@ -1,0 +1,337 @@
+// This Pine Script® code is subject to the terms of the MIT License.
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  0DTE CREDIT SPREAD LAB — which timeframe, which time of day?
+//
+//  Replays the chart's history and, for every Strat combo that completes on
+//  each test timeframe (default 15m / 30m / 1h), opens a simulated 0DTE credit
+//  spread at the next bar's open and holds it to the 16:00 close:
+//     bullish combo → bull put spread,  bearish combo → bear call spread
+//  Short strike = entry price ∓ N × remaining 1σ move (VIX1D, √time-scaled).
+//
+//  BASELINE = sell a spread at the start of every time slot with NO signal.
+//  A timeframe/slot only has an edge if it beats the baseline for that slot.
+//
+//  Results land in a table: rows = time of day, columns = baseline + each TF.
+//  The pane plots each strategy's cumulative P&L.
+//
+//  Use on an SPX chart at 15m (most history) or 5m. Credits are Black-Scholes
+//  estimates with flat VIX1D vol, so trust win rates more than dollars.
+//  Not financial advice.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("0DTE Credit Spread Lab — Timeframe × Time of Day", shorttitle = "0DTE Lab", overlay = false)
+
+string TZ = "America/New_York"
+
+// ───────────────────────────── Inputs ─────────────────────────────
+string G1 = "① What to test"
+string tfA = input.timeframe("15", "Timeframe A", group = G1)
+string tfB = input.timeframe("30", "Timeframe B", group = G1)
+string tfC = input.timeframe("60", "Timeframe C", group = G1)
+string sides = input.string("Both", "Sides", options = ["Both", "Put spreads only", "Call spreads only"], group = G1)
+bool useFtfc = input.bool(false, "Require Daily + Weekly continuity with the signal", group = G1, tooltip = "Bull signals only count if price is above today's open AND this week's open (reverse for bear).")
+int bucketMins = input.int(30, "Time-of-day bucket (minutes)", options = [30, 60], group = G1)
+
+string G2 = "② Spread rules"
+float kSigma    = input.float(1.0, "Short strike = N × remaining 1σ from price", minval = 0.1, step = 0.1, group = G2)
+float width     = input.float(10, "Spread width (points)", minval = 1, group = G2)
+float strikeInc = input.float(5, "Strike increment", minval = 0.5, step = 0.5, group = G2, tooltip = "5 for SPX, 1 for SPY/XSP.")
+float minCredit = input.float(0.20, "Skip trade if est. credit below", minval = 0, step = 0.05, group = G2, tooltip = "Late-day far-OTM spreads pay almost nothing. This drops them like a real trader would.")
+float cost      = input.float(0.10, "Fees + slippage per spread (points)", minval = 0, step = 0.05, group = G2)
+int minMinsLeft = input.int(15, "No entries with fewer than N minutes left", minval = 1, group = G2)
+string ivSym    = input.symbol("CBOE:VIX1D", "Implied-vol index", group = G2, tooltip = "Falls back to TVC:VIX if unavailable.")
+
+string G3 = "③ Display"
+int minN        = input.int(15, "Min trades before a cell can be 'best'", minval = 1, group = G3)
+string showMode = input.string("EV per spread", "Cells show", options = ["EV per spread", "Edge vs baseline", "Win rate"], group = G3)
+string tblPosIn = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = G3)
+string tszIn    = input.string("Small", "Table text", options = ["Tiny", "Small", "Normal"], group = G3)
+
+// ───────────────────────────── Helpers ─────────────────────────────
+f_type() =>
+    int t = 1
+    if high > high[1] and low < low[1]
+        t := 3
+    else if high > high[1]
+        t := 2
+    else if low < low[1]
+        t := -2
+    t
+
+// Strat combo completing on this bar: +1 bull, −1 bear, 0 none
+// (2-1-2, 3-1-2, 3-2-2, 1-2-2 RevStrat, 2-2 reversal)
+f_combo() =>
+    int c = f_type()
+    int b = c[1]
+    int a = c[2]
+    int r = 0
+    if b == 1 and (math.abs(a) == 2 or a == 3)
+        r := c == 2 ? 1 : c == -2 ? -1 : 0
+    else if (a == 3 or a == 1) and b == -2 and c == 2
+        r := 1
+    else if (a == 3 or a == 1) and b == 2 and c == -2
+        r := -1
+    else if b == -2 and c == 2
+        r := 1
+    else if b == 2 and c == -2
+        r := -1
+    r
+
+// Previous COMPLETED bar's combo + its open time (non-repainting idiom)
+f_pack() =>
+    int c = f_combo()
+    [c[1], time[1]]
+
+// Normal CDF (Abramowitz–Stegun 26.2.17)
+f_ncdf(float x) =>
+    float t = 1.0 / (1.0 + 0.2316419 * math.abs(x))
+    float d = 0.3989422804014327 * math.exp(-x * x / 2.0)
+    float p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    x >= 0 ? 1.0 - p : p
+
+// Undiscounted Black-Scholes; sd = total stdev to expiry (fraction)
+f_bs(float S, float K, float sd, bool isCall) =>
+    float d1 = (math.log(S / K) + 0.5 * sd * sd) / sd
+    float d2 = d1 - sd
+    isCall ? S * f_ncdf(d1) - K * f_ncdf(d2) : K * f_ncdf(-d2) - S * f_ncdf(-d1)
+
+f_hm(int m) =>
+    int h = int(math.floor(m / 60))
+    int mm = m % 60
+    str.tostring(h) + ":" + (mm < 10 ? "0" : "") + str.tostring(mm)
+
+f_tfName(string tf) =>
+    tf == "60" ? "1h" : tf == "120" ? "2h" : tf == "240" ? "4h" : not na(str.tonumber(tf)) ? tf + "m" : tf
+
+f_signed(float x) =>
+    (x >= 0 ? "+" : "") + str.tostring(x, "#")
+
+f_sideOk(int side) =>
+    sides == "Both" or (sides == "Put spreads only" and side == 1) or (sides == "Call spreads only" and side == -1)
+
+// ───────────────────────────── Data ─────────────────────────────
+bool inRth  = not na(time(timeframe.period, "0930-1600", TZ))
+bool newRth = inRth and (not inRth[1] or dayofmonth(time, TZ) != dayofmonth(time[1], TZ))   // SPX has no after-hours bars, so also detect a date change
+int mOpen   = hour(time, TZ) * 60 + minute(time, TZ)
+int mClose  = hour(time_close, TZ) * 60 + minute(time_close, TZ)
+int nb      = int(390 / bucketMins)
+
+float ivRaw  = request.security(ivSym, timeframe.period, close, ignore_invalid_symbol = true)
+float ivBack = request.security("TVC:VIX", timeframe.period, close, ignore_invalid_symbol = true)
+float ivNow  = not na(ivRaw) ? ivRaw : ivBack
+float ivPrev = ivNow[1]                      // known at this bar's open
+
+[cA, hA] = request.security(syminfo.tickerid, tfA, f_pack(), lookahead = barmerge.lookahead_on)
+[cB, hB] = request.security(syminfo.tickerid, tfB, f_pack(), lookahead = barmerge.lookahead_on)
+[cC, hC] = request.security(syminfo.tickerid, tfC, f_pack(), lookahead = barmerge.lookahead_on)
+// A new HTF bar just completed when its open time changes
+bool evA = not na(hA) and not na(hA[1]) and hA != hA[1] and not na(cA) and cA != 0
+bool evB = not na(hB) and not na(hB[1]) and hB != hB[1] and not na(cB) and cB != 0
+bool evC = not na(hC) and not na(hC[1]) and hC != hC[1] and not na(cC) and cC != 0
+
+float dOpen = request.security(syminfo.tickerid, "D", open, lookahead = barmerge.lookahead_on)
+float wOpen = request.security(syminfo.tickerid, "W", open, lookahead = barmerge.lookahead_on)
+f_ftfcOk(int dir) =>
+    not useFtfc or (dir > 0 ? open > dOpen and open > wOpen : open < dOpen and open < wOpen)
+
+// ───────────────────────────── State ─────────────────────────────
+int NS = 4          // 0 = baseline, 1 = A, 2 = B, 3 = C
+int STRIDE = 26     // max buckets per strategy
+var array<float> stN = array.new<float>(NS * STRIDE, 0.0)
+var array<float> stW = array.new<float>(NS * STRIDE, 0.0)
+var array<float> stP = array.new<float>(NS * STRIDE, 0.0)
+var array<float> stT = array.new<float>(NS * STRIDE, 0.0)
+var array<float> cum = array.new<float>(NS, 0.0)
+
+var array<int>   oSide  = array.new<int>()
+var array<float> oK     = array.new<float>()
+var array<float> oCr    = array.new<float>()
+var array<int>   oIdx   = array.new<int>()
+var array<bool>  oTouch = array.new<bool>()
+
+var int days = 0
+var float lastRthClose = na
+
+f_settle(float px) =>
+    int n = array.size(oSide)
+    if n > 0 and not na(px)
+        for i = 0 to n - 1
+            int sd = array.get(oSide, i)
+            float k = array.get(oK, i)
+            float intr = sd == 1 ? math.max(0.0, k - px) : math.max(0.0, px - k)
+            float pnl = (array.get(oCr, i) - math.min(width, intr) - cost) * 100
+            int idx = array.get(oIdx, i)
+            array.set(stN, idx, array.get(stN, idx) + 1)
+            array.set(stW, idx, array.get(stW, idx) + (intr == 0 ? 1 : 0))
+            array.set(stP, idx, array.get(stP, idx) + pnl)
+            array.set(stT, idx, array.get(stT, idx) + (array.get(oTouch, i) ? 1 : 0))
+            int s = int(math.floor(idx / STRIDE))
+            array.set(cum, s, array.get(cum, s) + pnl)
+    array.clear(oSide)
+    array.clear(oK)
+    array.clear(oCr)
+    array.clear(oIdx)
+    array.clear(oTouch)
+
+f_enter(int s, int side, int mEntry) =>
+    float minsLeft = 960 - mEntry
+    if mEntry > 570 and mEntry < 960 and minsLeft >= minMinsLeft and not na(ivPrev) and ivPrev > 0
+        float S  = open
+        float sd = ivPrev / 100 * math.sqrt(minsLeft / (252.0 * 390.0))
+        float em = S * sd
+        float k  = side == 1 ? math.floor((S - kSigma * em) / strikeInc) * strikeInc : math.ceil((S + kSigma * em) / strikeInc) * strikeInc
+        float kl = side == 1 ? k - width : k + width
+        float cr = side == 1 ? f_bs(S, k, sd, false) - f_bs(S, kl, sd, false) : f_bs(S, k, sd, true) - f_bs(S, kl, sd, true)
+        if cr >= minCredit
+            int b = int(math.floor((mEntry - 570) / bucketMins))
+            array.push(oSide, side)
+            array.push(oK, k)
+            array.push(oCr, cr)
+            array.push(oIdx, s * STRIDE + b)
+            array.push(oTouch, false)
+
+// ───────────────────────────── Engine ─────────────────────────────
+if newRth
+    f_settle(lastRthClose)          // leftovers (half days / missing 16:00 bar)
+    days += 1
+
+if inRth
+    // mark short strikes that price traded through
+    int n = array.size(oSide)
+    if n > 0
+        for i = 0 to n - 1
+            int sd = array.get(oSide, i)
+            float k = array.get(oK, i)
+            if (sd == 1 and low <= k) or (sd == -1 and high >= k)
+                array.set(oTouch, i, true)
+    if not newRth
+        // Baseline: every bucket start, no signal
+        if mOpen > 570 and (mOpen - 570) % bucketMins == 0
+            if f_sideOk(1)
+                f_enter(0, 1, mOpen)
+            if f_sideOk(-1)
+                f_enter(0, -1, mOpen)
+        if evA and f_sideOk(cA) and f_ftfcOk(cA)
+            f_enter(1, cA, mOpen)
+        if evB and f_sideOk(cB) and f_ftfcOk(cB)
+            f_enter(2, cB, mOpen)
+        if evC and f_sideOk(cC) and f_ftfcOk(cC)
+            f_enter(3, cC, mOpen)
+    lastRthClose := close
+    if mClose >= 960
+        f_settle(close)
+
+// ───────────────────────────── Pane: cumulative P&L ─────────────────────────────
+hline(0, "Zero", color.new(color.gray, 50))
+plot(array.get(cum, 0), "Baseline (no signal)", color.new(color.gray, 0), 2)
+plot(array.get(cum, 1), "Timeframe A", color.new(#26a69a, 0), 2)
+plot(array.get(cum, 2), "Timeframe B", color.new(#29b6f6, 0), 2)
+plot(array.get(cum, 3), "Timeframe C", color.new(#ffa726, 0), 2)
+
+// ───────────────────────────── Results table ─────────────────────────────
+string tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+string tsz = tszIn == "Tiny" ? size.tiny : tszIn == "Normal" ? size.normal : size.small
+
+var table tb = table.new(tblPos, 5, 30, bgcolor = color.new(#0e1117, 5), frame_color = color.new(#3a3f4b, 0), frame_width = 1, border_color = color.new(#2a2e39, 0), border_width = 1)
+
+f_ev(int idx) =>
+    float n = array.get(stN, idx)
+    n > 0 ? array.get(stP, idx) / n : na
+
+if barstate.islast
+    // locate the best signal cell and the best baseline slot
+    int bestS = -1
+    int bestB = -1
+    float bestEv = -1e10
+    int bestBaseB = -1
+    float bestBaseEv = -1e10
+    for s = 0 to NS - 1
+        for b = 0 to nb - 1
+            int idx = s * STRIDE + b
+            float n = array.get(stN, idx)
+            if n >= minN
+                float ev = array.get(stP, idx) / n
+                if s == 0 and ev > bestBaseEv
+                    bestBaseEv := ev
+                    bestBaseB := b
+                if s > 0 and ev > bestEv
+                    bestEv := ev
+                    bestS := s
+                    bestB := b
+
+    array<string> names = array.from("Baseline", f_tfName(tfA), f_tfName(tfB), f_tfName(tfC))
+    table.cell(tb, 0, 0, "Entry (ET)", text_color = color.white, text_size = tsz)
+    for s = 0 to NS - 1
+        table.cell(tb, s + 1, 0, array.get(names, s), text_color = color.white, text_size = tsz)
+
+    for b = 0 to nb - 1
+        int m0 = 570 + b * bucketMins
+        table.cell(tb, 0, b + 1, f_hm(m0) + "–" + f_hm(m0 + bucketMins), text_color = color.new(color.white, 30), text_size = tsz, text_halign = text.align_left)
+        float baseEv = f_ev(b)
+        for s = 0 to NS - 1
+            int idx = s * STRIDE + b
+            float n = array.get(stN, idx)
+            string txt = "—"
+            color tc = color.new(color.gray, 40)
+            color bg = color.new(#0e1117, 100)
+            if n > 0
+                float ev = array.get(stP, idx) / n
+                float wr = 100 * array.get(stW, idx) / n
+                string main = showMode == "Win rate" ? str.tostring(wr, "#") + "%" : showMode == "Edge vs baseline" and s > 0 ? (na(baseEv) ? "n/a" : "$" + f_signed(ev - baseEv)) : "$" + f_signed(ev)
+                txt := main + "  " + str.tostring(wr, "#") + "%  n" + str.tostring(n, "#")
+                if showMode == "Win rate"
+                    txt := main + "  $" + f_signed(ev) + "  n" + str.tostring(n, "#")
+                // In edge mode, color by edge vs baseline (not raw EV)
+                float score = showMode == "Edge vs baseline" and s > 0 ? (na(baseEv) ? na : ev - baseEv) : ev
+                tc := n < minN or na(score) ? color.new(color.gray, 20) : score > 0 ? color.lime : color.red
+                if n >= minN and not na(score)
+                    bg := score > 0 ? color.new(color.lime, 90) : color.new(color.red, 88)
+                if s == bestS and b == bestB
+                    bg := color.new(color.lime, 55)
+                    tc := color.black
+                if s == 0 and b == bestBaseB
+                    bg := color.new(color.gray, 55)
+                    tc := color.black
+            table.cell(tb, s + 1, b + 1, txt, text_color = tc, bgcolor = bg, text_size = tsz)
+
+    // Totals per strategy
+    int rT = nb + 1
+    table.cell(tb, 0, rT, "ALL DAY", text_color = color.white, text_size = tsz, text_halign = text.align_left)
+    for s = 0 to NS - 1
+        float n = 0.0
+        float w = 0.0
+        float p = 0.0
+        for b = 0 to nb - 1
+            int idx = s * STRIDE + b
+            n += array.get(stN, idx)
+            w += array.get(stW, idx)
+            p += array.get(stP, idx)
+        string t = n > 0 ? "$" + f_signed(p / n) + "  " + str.tostring(100 * w / n, "#") + "%  n" + str.tostring(n, "#") : "—"
+        table.cell(tb, s + 1, rT, t, text_color = n > 0 ? (p > 0 ? color.lime : color.red) : color.gray, text_size = tsz)
+
+    // Verdict
+    string verdict = ""
+    if not timeframe.isintraday
+        verdict := "⚠ Put this on an intraday chart (15m or 5m)."
+    else if timeframe.in_seconds() > math.min(timeframe.in_seconds(tfA), timeframe.in_seconds(tfB), timeframe.in_seconds(tfC))
+        verdict := "⚠ Chart timeframe must be ≤ the smallest test timeframe."
+    else if bestS < 0
+        verdict := "Not enough trades yet. Lower 'Min trades' or load more history."
+    else
+        int m0 = 570 + bestB * bucketMins
+        float bEv = f_ev(bestB)
+        float edge = na(bEv) ? na : bestEv - bEv
+        verdict := "BEST: " + array.get(names, bestS) + " signals @ " + f_hm(m0) + "–" + f_hm(m0 + bucketMins) + "  → $" + f_signed(bestEv) + "/spread" + (na(edge) ? "" : "  (" + f_signed(edge) + " vs baseline slot)")
+        if not na(edge) and edge <= 0
+            verdict += "  ⚠ no better than selling blind"
+        verdict += "   |   best blind slot: " + (bestBaseB >= 0 ? f_hm(570 + bestBaseB * bucketMins) + " $" + f_signed(bestBaseEv) : "—")
+    table.cell(tb, 0, rT + 1, verdict, text_color = color.white, text_size = tsz, text_halign = text.align_left)
+    table.merge_cells(tb, 0, rT + 1, 4, rT + 1)
+    string foot = str.tostring(days) + " sessions · " + str.tostring(kSigma) + "σ short · " + str.tostring(width) + "-wide · cost " + str.tostring(cost) + " · cells: " + (showMode == "Win rate" ? "win%  EV  n" : "EV  win%  n") + " · grey = fewer than " + str.tostring(minN) + " trades"
+    table.cell(tb, 0, rT + 2, foot, text_color = color.new(color.white, 45), text_size = size.tiny, text_halign = text.align_left)
+    table.merge_cells(tb, 0, rT + 2, 4, rT + 2)
